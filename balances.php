@@ -1,7 +1,7 @@
 <?php
 require 'db.php';
 
-function getGroupBalances($group_id) {
+function getGroupBalances($group_id, $unsettled_only = false) {
     global $conn;
     $balances = [];
 
@@ -9,6 +9,10 @@ function getGroupBalances($group_id) {
             FROM expenses e
             JOIN expense_splits es ON e.id = es.expense_id
             WHERE e.group_id = ?";
+    // The app passes true so expenses from earlier settle-ups are left out (see history.php)
+    if ($unsettled_only) {
+        $sql .= " AND e.settled_at IS NULL";
+    }
 
     $stmt = $conn->prepare($sql);
     $stmt->bind_param("i", $group_id);
