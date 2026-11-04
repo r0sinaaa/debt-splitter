@@ -1,488 +1,132 @@
 <?php
-require 'db.php';
-require 'balances.php';
-require 'algorithm.php';
-require 'shared_settlement.php';
-require 'history.php';
+require 'includes/app.php';
 
-$group_id = 1; // hardcoded for now - your "Flat 4B" test group
-ensureSettledColumn();
-
-$members = [];
-$stmt = $conn->prepare("SELECT id, name FROM members WHERE group_id = ?");
-$stmt->bind_param("i", $group_id);
-$stmt->execute();
-$result = $stmt->get_result();
-while ($row = $result->fetch_assoc()) {
-    $members[$row['id']] = $row['name'];
-}
-
-// Form values: by default everyone is ticked; after an error, keep what the user entered
-$form = [
-    'payer_id'    => array_key_first($members),
-    'amount'      => '',
-    'description' => '',
-    'split_with'  => array_keys($members),
-];
-$error = '';
-
-// Which settlement to show: fewest payments overall, or only between people who shared an expense
-$view = (($_GET['view'] ?? $_POST['view'] ?? '') === 'shared') ? 'shared' : 'fewest';
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'settle') {
-    // Everyone has paid: move the current expenses into the history
-    settleUp($group_id);
-    header("Location: index.php" . ($view === 'shared' ? '?view=shared' : ''));
-    exit;
-} elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $payer_id = (int) ($_POST['payer_id'] ?? 0);
-    $amount = (float) ($_POST['amount'] ?? 0);
-    $description = trim($_POST['description'] ?? '');
-    // Only keep ticked people who really belong to this group
-    $split_ids = array_values(array_intersect(
-        array_map('intval', $_POST['split_with'] ?? []),
-        array_keys($members)
-    ));
-
-    if (!isset($members[$payer_id])) {
-        $error = 'Choose who paid.';
-    } elseif ($amount <= 0) {
-        $error = 'Enter an amount greater than zero.';
-    } elseif ($description === '') {
-        $error = 'Add a short description.';
-    } elseif (count($split_ids) === 0) {
-        $error = 'Tick at least one person to split the expense between.';
-    } else {
-        $stmt = $conn->prepare("INSERT INTO expenses (group_id, payer_id, amount, description) VALUES (?, ?, ?, ?)");
-        $stmt->bind_param("iids", $group_id, $payer_id, $amount, $description);
-        $stmt->execute();
-        $expense_id = $conn->insert_id;
-
-        // Work in cents so the shares always add up to exactly the amount paid
-        // (e.g. 10.00 between 3 people becomes 3.34 + 3.33 + 3.33)
-        $total_cents = (int) round($amount * 100);
-        $people = count($split_ids);
-        $base_cents = intdiv($total_cents, $people);
-        $leftover_cents = $total_cents % $people;
-
-        $stmt = $conn->prepare("INSERT INTO expense_splits (expense_id, member_id, share) VALUES (?, ?, ?)");
-        foreach ($split_ids as $i => $member_id) {
-            $share = ($base_cents + ($i < $leftover_cents ? 1 : 0)) / 100;
-            $stmt->bind_param("iid", $expense_id, $member_id, $share);
-            $stmt->execute();
-        }
-
-        header("Location: index.php" . ($view === 'shared' ? '?view=shared' : ''));
-        exit;
-    }
-
-    $form = [
-        'payer_id'    => $payer_id,
-        'amount'      => $_POST['amount'] ?? '',
-        'description' => $description,
-        'split_with'  => $split_ids,
-    ];
-}
-
-// Only expenses added since the last settle-up count towards what people owe now
-$balances = getGroupBalances($group_id, true);
-// A brand-new group has no balances yet, so there is nothing to settle
-$transactions = empty($balances) ? [] : greedySimplify($balances);
-
-if ($view === 'shared') {
-    [$debts, $shared] = getPairwiseDebts($group_id);
-    $transactions = simplifySharedOnly($debts, $shared);
-}
-$payment_count = count($transactions);
-
-$history = getExpenseHistory($group_id);
+$user = currentUser();
+pageStart('', $user, 'page-home');
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Debt Splitter</title>
-    <style>
-        *, *::before, *::after {
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f4f5f7;
-            margin: 0;
-            /* smaller outer gap on phones, up to 40px on desktop */
-            padding: clamp(12px, 4vw, 40px);
-            color: #222;
-            line-height: 1.4;
-            -webkit-text-size-adjust: 100%;
-        }
-        .container {
-            max-width: 480px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            padding: clamp(20px, 5vw, 32px);
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        h1 {
-            margin: 0;
-            font-size: clamp(22px, 5vw, 26px);
-        }
-        h2 {
-            font-size: 16px;
-            color: #555;
-            border-top: 1px solid #eee;
-            padding-top: 20px;
-            margin: 24px 0 12px;
-        }
-        label {
-            display: block;
-            font-size: 14px;
-            color: #444;
-            margin-bottom: 14px;
-        }
-        select, input[type="number"], input[type="text"] {
-            display: block;
-            width: 100%;
-            min-height: 44px;       /* comfortable tap target */
-            padding: 10px;
-            margin-top: 6px;
-            border: 1px solid #ccc;
-            border-radius: 6px;
-            font-size: 16px;        /* 16px stops iPhones zooming in on focus */
-            font-family: inherit;
-            background: white;
-            color: inherit;
-        }
-        button {
-            width: 100%;
-            min-height: 44px;
-            background: #2563eb;
-            color: white;
-            border: none;
-            padding: 12px 18px;
-            border-radius: 6px;
-            font-size: 16px;
-            font-family: inherit;
-            cursor: pointer;
-        }
-        button:hover {
-            background: #1d4ed8;
-        }
-        select:focus-visible, input:focus-visible, button:focus-visible {
-            outline: 2px solid #2563eb;
-            outline-offset: 2px;
-        }
-        ul {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-        .payments li {
-            background: #f0f9f0;
-            border: 1px solid #cdeecd;
-            padding: 12px 14px;
-            border-radius: 6px;
-            margin-bottom: 8px;
-            font-size: 15px;
-            overflow-wrap: anywhere;  /* long names wrap instead of overflowing */
-        }
-        p {
-            color: #666;
-            font-size: 14px;
-            margin: 0;
-        }
+<main id="main">
+    <section class="hero">
+        <div class="hero-text">
+            <h1>Split your debts, not your friendships.</h1>
+            <p class="hero-lede">
+                Add what everyone paid. <?= e(APP_NAME) ?> works out who pays whom in as few payments
+                as possible, then emails a reminder to the people who owe until it's settled.
+            </p>
+            <div class="hero-actions">
+                <?php if ($user): ?>
+                    <a class="btn btn-big" href="groups.php">Go to your groups</a>
+                <?php else: ?>
+                    <a class="btn btn-big" href="register.php">Create a free account</a>
+                    <a class="text-link" href="login.php">I already have one</a>
+                <?php endif; ?>
+            </div>
+        </div>
 
-        fieldset {
-            border: 0;
-            padding: 0;
-            margin: 0 0 16px;
-            min-width: 0;
-        }
-        legend {
-            font-size: 14px;
-            color: #444;
-            padding: 0;
-            margin-bottom: 8px;
-        }
-        .split-options {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .person {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            min-height: 44px;
-            margin: 0;
-            padding: 8px 12px;
-            border: 1px solid #ccc;
-            border-radius: 6px;
-            font-size: 15px;
-            color: #222;
-            cursor: pointer;
-            overflow-wrap: anywhere;
-        }
-        .person input {
-            width: 18px;
-            height: 18px;
-            margin: 0;
-            flex-shrink: 0;
-            accent-color: #2563eb;
-        }
-        .person:has(input:checked) {
-            border-color: #2563eb;
-            background: #eff4ff;
-        }
-        .person:has(input:focus-visible) {
-            outline: 2px solid #2563eb;
-            outline-offset: 2px;
-        }
-        .error {
-            color: #b91c1c;
-            background: #fef2f2;
-            border: 1px solid #fecaca;
-            border-radius: 6px;
-            padding: 10px 12px;
-            margin-bottom: 14px;
-        }
+        <figure class="untangle" id="untangle" data-state="after">
+            <svg viewBox="0 0 420 320" role="img" aria-labelledby="untangle-caption">
+                <defs>
+                    <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                        <path d="M0 0 L10 5 L0 10 z" fill="#000"/>
+                    </marker>
+                </defs>
 
-        .view-switch {
-            display: flex;
-            gap: 4px;
-            padding: 4px;
-            margin-bottom: 12px;
-            background: #f0f1f4;
-            border-radius: 8px;
-        }
-        .view-switch a {
-            flex: 1;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 44px;
-            padding: 8px;
-            border-radius: 6px;
-            font-size: 14px;
-            color: #444;
-            text-align: center;
-            text-decoration: none;
-        }
-        .view-switch a[aria-current="page"] {
-            background: white;
-            color: #222;
-            font-weight: 600;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
-        }
-        .view-switch a:focus-visible {
-            outline: 2px solid #2563eb;
-            outline-offset: 2px;
-        }
-        .view-note {
-            margin-bottom: 12px;
-        }
+                <!-- Before: six separate IOUs between four friends -->
+                <g class="ious">
+                    <path d="M300 227 L125 96" marker-end="url(#arrow)"/>
+                    <path d="M90 212 L90 114" marker-end="url(#arrow)"/>
+                    <path d="M128 70 L286 70" marker-end="url(#arrow)"/>
+                    <path d="M120 227 L295 96" marker-end="url(#arrow)"/>
+                    <path d="M292 250 L134 250" marker-end="url(#arrow)"/>
+                    <path d="M330 108 L330 206" marker-end="url(#arrow)"/>
+                    <g class="tag"><rect x="222" y="174" width="44" height="22" rx="11"/><text x="244" y="189"><?= e(CURRENCY) ?>12</text></g>
+                    <g class="tag"><rect x="72" y="149" width="36" height="22" rx="11"/><text x="90" y="164"><?= e(CURRENCY) ?>8</text></g>
+                    <g class="tag"><rect x="192" y="59" width="36" height="22" rx="11"/><text x="210" y="74"><?= e(CURRENCY) ?>6</text></g>
+                    <g class="tag"><rect x="154" y="174" width="44" height="22" rx="11"/><text x="176" y="189"><?= e(CURRENCY) ?>10</text></g>
+                    <g class="tag"><rect x="192" y="239" width="36" height="22" rx="11"/><text x="210" y="254"><?= e(CURRENCY) ?>4</text></g>
+                    <g class="tag"><rect x="312" y="149" width="36" height="22" rx="11"/><text x="330" y="164"><?= e(CURRENCY) ?>3</text></g>
+                </g>
 
-        button.secondary {
-            background: white;
-            color: #2563eb;
-            border: 1px solid #2563eb;
-        }
-        button.secondary:hover {
-            background: #eff4ff;
-        }
-        .settle-form {
-            margin-top: 16px;
-        }
-        .settle-form p {
-            margin-top: 8px;
-        }
+                <!-- After: the same money, settled in two payments -->
+                <g class="payments">
+                    <path d="M90 212 L90 114" marker-end="url(#arrow)" pathLength="1"/>
+                    <path d="M330 212 L330 114" marker-end="url(#arrow)" pathLength="1"/>
+                    <g class="tag tag-marked"><rect x="100" y="149" width="50" height="22" rx="11"/><text x="125" y="164"><?= e(CURRENCY) ?>14</text></g>
+                    <g class="tag tag-marked"><rect x="340" y="149" width="50" height="22" rx="11"/><text x="365" y="164"><?= e(CURRENCY) ?>13</text></g>
+                </g>
 
-        h3 {
-            font-size: 14px;
-            font-weight: 600;
-            color: #444;
-            margin: 0 0 4px;
-        }
-        .history-list li {
-            padding: 12px 0;
-            border-bottom: 1px solid #eee;
-        }
-        .history-list li:last-child {
-            border-bottom: 0;
-        }
-        .expense-top {
-            display: flex;
-            justify-content: space-between;
-            gap: 12px;
-            font-size: 15px;
-        }
-        .expense-desc {
-            overflow-wrap: anywhere;
-        }
-        .expense-amount {
-            white-space: nowrap;
-            font-variant-numeric: tabular-nums;
-        }
-        .history-list p {
-            margin-top: 2px;
-            font-size: 13px;
-            overflow-wrap: anywhere;
-        }
-        .round {
-            border-top: 1px solid #eee;
-        }
-        .round summary {
-            padding: 12px 0;        /* keeps the open/close arrow and a good tap size */
-            font-size: 14px;
-            color: #444;
-            cursor: pointer;
-        }
-        .round summary:focus-visible {
-            outline: 2px solid #2563eb;
-            outline-offset: 2px;
-        }
-        .round .history-list {
-            padding-left: 12px;
-            border-left: 2px solid #eee;
-            margin-bottom: 12px;
-        }
-
-        /* Desktop and tablets in landscape: form and settlement side by side */
-        @media (min-width: 760px) {
-            .container {
-                max-width: 880px;
-            }
-            .layout {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                column-gap: 40px;
-                align-items: start;
-            }
-            button {
-                width: auto;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-    <h1>Flat 4B</h1>
-
-    <div class="layout">
-        <section>
-            <h2>Add an expense</h2>
-            <?php if ($error): ?>
-                <p class="error" role="alert"><?= htmlspecialchars($error) ?></p>
-            <?php endif; ?>
-            <form method="POST">
-                <input type="hidden" name="view" value="<?= $view ?>">
-                <label>Who paid?
-                    <select name="payer_id" required>
-                        <?php foreach ($members as $id => $name): ?>
-                            <option value="<?= $id ?>" <?= $id == $form['payer_id'] ? 'selected' : '' ?>><?= htmlspecialchars($name) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </label>
-
-                <label>Amount: <input type="number" step="0.01" min="0.01" name="amount" inputmode="decimal" value="<?= htmlspecialchars($form['amount']) ?>" required></label>
-                <label>Description: <input type="text" name="description" value="<?= htmlspecialchars($form['description']) ?>" required></label>
-
-                <fieldset>
-                    <legend>Split equally between</legend>
-                    <div class="split-options">
-                        <?php foreach ($members as $id => $name): ?>
-                            <label class="person">
-                                <input type="checkbox" name="split_with[]" value="<?= $id ?>" <?= in_array($id, $form['split_with']) ? 'checked' : '' ?>>
-                                <?= htmlspecialchars($name) ?>
-                            </label>
-                        <?php endforeach; ?>
-                    </div>
-                </fieldset>
-
-                <button type="submit">Add Expense</button>
-            </form>
-        </section>
-
-        <section>
-            <h2>Settlement</h2>
-            <nav class="view-switch" aria-label="Settlement view">
-                <a href="index.php" <?= $view === 'fewest' ? 'aria-current="page"' : '' ?>>Fewest payments</a>
-                <a href="index.php?view=shared" <?= $view === 'shared' ? 'aria-current="page"' : '' ?>>Only people who shared</a>
-            </nav>
-            <?php if (empty($transactions)): ?>
-                <p>Everyone's settled up!</p>
-            <?php else: ?>
-                <p class="view-note">
-                    <?= $payment_count ?> <?= $payment_count === 1 ? 'payment' : 'payments' ?>,
-                    <?= $view === 'shared'
-                        ? 'each between people who have shared an expense.'
-                        : 'kept as few as possible. Some may be between people who haven\'t shared an expense.' ?>
-                </p>
-                <ul class="payments">
-                    <?php foreach ($transactions as $t): ?>
-                        <li><?= htmlspecialchars($members[$t['from']]) ?> pays <?= htmlspecialchars($members[$t['to']]) ?>: €<?= number_format($t['amount'], 2) ?></li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-
-            <?php if (!empty($history['open'])): ?>
-                <form method="POST" class="settle-form"
-                      onsubmit="return confirm('Mark everything as paid? These expenses will move to the history, and new expenses will start a fresh settlement.');">
-                    <input type="hidden" name="action" value="settle">
-                    <input type="hidden" name="view" value="<?= $view ?>">
-                    <button type="submit" class="secondary">Mark all as paid</button>
-                    <p>Press this once everyone has paid. New expenses will then start a fresh settlement.</p>
-                </form>
-            <?php endif; ?>
-        </section>
-    </div>
-
-    <section class="history">
-        <h2>Expense history</h2>
-        <?php if (empty($history['open']) && empty($history['settled'])): ?>
-            <p>No expenses yet.</p>
-        <?php endif; ?>
-
-        <?php if (!empty($history['open'])): ?>
-            <?php if (!empty($history['settled'])): ?>
-                <h3>Not settled yet</h3>
-            <?php endif; ?>
-            <ul class="history-list">
-                <?php foreach ($history['open'] as $expense): ?>
-                    <li>
-                        <div class="expense-top">
-                            <span class="expense-desc"><?= htmlspecialchars($expense['description']) ?></span>
-                            <span class="expense-amount">€<?= number_format($expense['amount'], 2) ?></span>
-                        </div>
-                        <p><?= htmlspecialchars(describeExpense($expense, $members)) ?></p>
-                    </li>
-                <?php endforeach; ?>
-            </ul>
-        <?php endif; ?>
-
-        <?php foreach ($history['settled'] as $settled_at => $round): ?>
-            <details class="round">
-                <summary>
-                    Settled <?= date('j M Y, H:i', strtotime($settled_at)) ?>
-                    · <?= count($round) ?> <?= count($round) === 1 ? 'expense' : 'expenses' ?>
-                    · €<?= number_format(array_sum(array_column($round, 'amount')), 2) ?>
-                </summary>
-                <ul class="history-list">
-                    <?php foreach ($round as $expense): ?>
-                        <li>
-                            <div class="expense-top">
-                                <span class="expense-desc"><?= htmlspecialchars($expense['description']) ?></span>
-                                <span class="expense-amount">€<?= number_format($expense['amount'], 2) ?></span>
-                            </div>
-                            <p><?= htmlspecialchars(describeExpense($expense, $members)) ?></p>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            </details>
-        <?php endforeach; ?>
+                <g class="people">
+                    <g><circle cx="90" cy="70" r="34"/><text x="90" y="75">Asha</text></g>
+                    <g><circle cx="330" cy="70" r="34"/><text x="330" y="75">Niraj</text></g>
+                    <g><circle cx="90" cy="250" r="34"/><text x="90" y="255">Leo</text></g>
+                    <g><circle cx="330" cy="250" r="34"/><text x="330" y="255">Mia</text></g>
+                </g>
+            </svg>
+            <figcaption id="untangle-caption">
+                <span class="caption-before">Six IOUs between four friends after a weekend away.</span>
+                <span class="caption-after">The same money, settled in two payments.</span>
+            </figcaption>
+            <button type="button" class="btn btn-quiet btn-small" id="untangle-toggle" aria-controls="untangle" hidden>
+                Show the IOUs again
+            </button>
+        </figure>
     </section>
-    </div>
-</body>
-</html>
+
+    <section class="steps" aria-labelledby="steps-title">
+        <h2 id="steps-title">How it works</h2>
+        <ol>
+            <li>
+                <h3>Start a group</h3>
+                <p>Your flat, a trip, a dinner out. Add everyone with their email address. Only you need an account.</p>
+            </li>
+            <li>
+                <h3>Add what was paid</h3>
+                <p>Who paid, how much, and who it was for. Shares are worked out to the cent, so they always add up.</p>
+            </li>
+            <li>
+                <h3>Settle up</h3>
+                <p>Everyone gets a short list of who to pay. Mark payments as they come in, and the rest stays on the list.</p>
+            </li>
+        </ol>
+    </section>
+
+    <section class="ways" aria-labelledby="ways-title">
+        <h2 id="ways-title">Two ways to settle</h2>
+        <div class="ways-grid">
+            <div>
+                <h3>Fewest payments</h3>
+                <p>The smallest number of transfers, even if that means paying someone you didn't split anything with directly.</p>
+            </div>
+            <div>
+                <h3>Only people who shared</h3>
+                <p>Everyone pays someone they actually split a cost with. Sometimes it takes an extra payment, but nobody gets a request from a stranger.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="nudge" aria-labelledby="nudge-title">
+        <div class="nudge-text">
+            <h2 id="nudge-title">Reminders go to the people who owe. Nobody else.</h2>
+            <p>
+                When you send reminders, everyone who still owes gets an email with their own amounts.
+                People who are owed money never get a message. Reminders stop the moment a payment is marked as paid.
+            </p>
+        </div>
+        <div class="email-msg" aria-label="Example reminder email">
+            <p class="msg-subject">Reminder: you owe <?= e(CURRENCY) ?>14.00 for Weekend in Aarhus</p>
+            <p class="msg-from">From <?= e(APP_NAME) ?>, on behalf of Asha</p>
+            <p class="msg-body">Hi Leo,<br><br>This is a reminder from Asha about Weekend in Aarhus. Here's what you still need to pay:</p>
+            <p class="msg-line"><span>Asha</span><span><?= e(CURRENCY) ?>14.00</span></p>
+        </div>
+    </section>
+
+    <section class="closer">
+        <h2>Start with the next thing you split.</h2>
+        <?php if ($user): ?>
+            <a class="btn btn-big" href="groups.php">Go to your groups</a>
+        <?php else: ?>
+            <a class="btn btn-big" href="register.php">Create a free account</a>
+        <?php endif; ?>
+    </section>
+</main>
+<script src="assets/home.js"></script>
+<?php pageEnd(); ?>
