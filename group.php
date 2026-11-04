@@ -196,6 +196,8 @@ $outstanding = groupOutstanding($group_id);
 $payment_count = count($transactions);
 $debt_edges = edgeCount($settlement['graph']);
 $settle_groups = count(connectedComponents($settlement['settlement']));
+// For the greedy vs exact comparison: what greedy alone would need on the same debt graph
+$greedy_count = $settlement['method'] === 'optimal' ? edgeCount(greedySettle($settlement['graph'])) : null;
 
 // Who can get a reminder (not you, and they need an email address)
 $remindable = array_filter(array_keys($debtors), fn($id) => $id !== $me && $members[$id]['email']);
@@ -288,6 +290,17 @@ pageStart($group['name'], $user, 'theme-blush');
                         It's usually the minimum, but not always.
                     <?php endif; ?>
                 </p>
+                <?php if ($greedy_count !== null): ?>
+                    <p class="muted mode-note">
+                        Greedy method: <?= $greedy_count ?> <?= $greedy_count === 1 ? 'payment' : 'payments' ?>.
+                        Exact method: <?= $payment_count ?> <?= $payment_count === 1 ? 'payment' : 'payments' ?>.
+                        <?php if ($greedy_count > $payment_count): ?>
+                            The exact method saves <?= $greedy_count - $payment_count ?> <?= $greedy_count - $payment_count === 1 ? 'payment' : 'payments' ?> here.
+                        <?php else: ?>
+                            Here greedy also finds the minimum.
+                        <?php endif; ?>
+                    </p>
+                <?php endif; ?>
                 <ul class="rows">
                     <?php foreach ($transactions as $t): ?>
                         <li>
